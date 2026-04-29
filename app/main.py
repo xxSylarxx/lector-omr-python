@@ -169,6 +169,133 @@ def _calibrar_grid(img_color, thresh):
     return secs, ys_grid, avg_r
 
 
+# ---------- deteccion grid CODIGO ----------
+
+# Coordenadas del grid CODIGO en la plantilla (base.png redimensionada a 1584).
+CODIGO_XS_PLANTILLA = [289, 313, 338, 362, 386, 411, 435, 459]
+CODIGO_YS_PLANTILLA = [341, 367, 393, 418, 443, 469, 494, 519, 544, 571]
+
+
+def _detectar_codigo_grid(img_color, hint_xs=None, hint_ys=None):
+    h, w = img_color.shape[:2]
+    if hint_ys is not None:
+        y0 = max(0, int(min(hint_ys)) - 30)
+        y1 = min(h, int(max(hint_ys)) + 30)
+    else:
+        y0, y1 = 0, int(h * 0.65)
+    if hint_xs is not None:
+        x0 = max(0, int(min(hint_xs)) - 25)
+        x1 = min(w, int(max(hint_xs)) + 25)
+    else:
+        x0, x1 = 0, int(w * 0.48)
+
+    roi = img_color[y0:y1, x0:x1]
+    todos_roi = _detectar_circulos(roi)
+    todos = [(x + x0, y + y0, r) for x, y, r in todos_roi]
+    if len(todos) < 30:
+        return None
+
+    def _agr(vals, tol=10):
+        clusters = []
+        for v in sorted(vals):
+            ok = False
+            for c in clusters:
+                if abs(v - sum(c) / len(c)) < tol:
+                    c.append(v); ok = True; break
+            if not ok:
+                clusters.append([v])
+        return sorted(round(sum(c) / len(c)) for c in clusters)
+
+    # 1) Tomar solo columnas X que tengan >=7 circulos (descarta texto/ruido).
+    xs_all = _agr([b[0] for b in todos], 8)
+    xs_dens = []  # [(cx, n_filas, [ys])]
+    for cx in xs_all:
+        ys_c = _agr([b[1] for b in todos if abs(b[0] - cx) <= 10], 10)
+        if len(ys_c) >= 7:
+            xs_dens.append((cx, len(ys_c), ys_c))
+
+    if len(xs_dens) < 8:
+        return None
+
+    # 2) Eliminar columnas duplicadas cercanas (<20 px), conservar la mas densa.
+    xs_dens.sort(key=lambda t: t[0])
+    filt = []
+    for t in xs_dens:
+        if filt and (t[0] - filt[-1][0]) < 20:
+            if t[1] > filt[-1][1]:
+                filt[-1] = t
+        else:
+            filt.append(t)
+
+    if len(filt) < 8:
+        return None
+
+    # 3) Buscar 8 columnas consecutivas con espaciado uniforme.
+    mejor = None
+    for i in range(len(filt) - 7):
+        g = filt[i:i + 8]
+        xs_g = [t[0] for t in g]
+        gaps = [xs_g[j + 1] - xs_g[j] for j in range(7)]
+        if not (all(14 <= d <= 35 for d in gaps) and max(gaps) - min(gaps) < 10):
+            continue
+        var = float(np.var(gaps))
+        score = (-sum(t[1] for t in g), var)
+        if mejor is None or score < mejor[0]:
+            mejor = (score, g)
+
+    if mejor is None:
+        return None
+
+    g = mejor[1]
+    cod_xs = [t[0] for t in g]
+
+    # Estimar paso vertical (sp) desde gaps internos de las 8 columnas.
+    gaps_pool = []
+    for cx in cod_xs:
+        ys_c = sorted(b[1] for b in todos if abs(b[0] - cx) <= 10)
+        for k in range(len(ys_c) - 1):
+            d = ys_c[k + 1] - ys_c[k]
+            if 18 <= d <= 32:
+                gaps_pool.append(d)
+    if len(gaps_pool) < 5:
+        return None
+    sp = float(np.median(gaps_pool))
+
+    # Reunir Y por columna (set).
+    ys_set_por_col = []
+    for cx in cod_xs:
+        ys_set_por_col.append(sorted(b[1] for b in todos if abs(b[0] - cx) <= 10))
+
+    if not any(ys_set_por_col):
+        return None
+    y_min = min(min(s) for s in ys_set_por_col if s)
+    y_max = max(max(s) for s in ys_set_por_col if s)
+
+    def _hay_circulo(ci, y, tol=7):
+        return any(abs(yy - y) <= tol for yy in ys_set_por_col[ci])
+
+    # Probar y0 en pasos de 1 px y contar matches en grid 8x10.
+    mejor_y0 = None
+    for y0_int in range(int(y_min) - 5, int(y_max - 9 * sp) + 6):
+        hits = 0
+        for k in range(10):
+            yk = y0_int + k * sp
+            for ci in range(8):
+                if _hay_circulo(ci, yk):
+                    hits += 1
+        if mejor_y0 is None or hits > mejor_y0[0]:
+            mejor_y0 = (hits, y0_int)
+
+    if mejor_y0 is None or mejor_y0[0] < 40:
+        return None
+
+    y0 = mejor_y0[1]
+    ys_grid = [round(y0 + k * sp) for k in range(10)]
+
+    avg_r = max(4, round(float(np.mean([b[2] for b in todos]))))
+    return cod_xs, ys_grid, avg_r
+
+
 # ---------- proceso principal ----------
 
 def process(img, plantilla_info):
@@ -185,14 +312,22 @@ def process(img, plantilla_info):
     )
     cal = _calibrar_grid(img, thresh_resp)
     if cal is None:
-        return {}
+        return {}, None
     secs_r, ys_r, avg_r = cal
 
     # Alinear plantilla -> espacio de la respuesta usando 3 puntos del grid.
     pts_p = _puntos_referencia(secs_p, ys_p)
     pts_r = _puntos_referencia(secs_r, ys_r)
-    plantilla_alineada = _alinear_plantilla_a_respuesta(
-        plantilla_gray, pts_p, pts_r, gray.shape
+    M = cv2.getAffineTransform(pts_p, pts_r)
+
+    def _aplicar_M(x, y):
+        return (M[0, 0] * x + M[0, 1] * y + M[0, 2],
+                M[1, 0] * x + M[1, 1] * y + M[1, 2])
+    h_img, w_img = gray.shape
+    plantilla_alineada = cv2.warpAffine(
+        plantilla_gray, M, (w_img, h_img),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE
     )
 
     # Diff: pixeles mas oscuros en la respuesta que en la plantilla = marcas.
@@ -223,7 +358,29 @@ def process(img, plantilla_info):
             else:
                 answers[q] = None
 
-    return {k: answers[k] for k in sorted(answers)}
+    # Leer CODIGO: predecir zona usando M y refinar con deteccion directa.
+    hint_ys = [_aplicar_M(CODIGO_XS_PLANTILLA[0], y)[1] for y in CODIGO_YS_PLANTILLA]
+    cod_cal = _detectar_codigo_grid(img, hint_ys=hint_ys)
+    if cod_cal is not None:
+        cod_xs, cod_ys, cod_r = cod_cal
+        digitos = []
+        for cx in cod_xs:
+            scores_d = []
+            for cy in cod_ys:
+                mask = np.zeros(marcas.shape, np.uint8)
+                cv2.circle(mask, (cx, cy), max(cod_r, 4), 255, -1)
+                filled = cv2.countNonZero(cv2.bitwise_and(marcas, marcas, mask=mask))
+                total  = cv2.countNonZero(mask)
+                scores_d.append(filled / total if total else 0.0)
+            mejor_ri = int(np.argmax(scores_d))
+            top_d    = scores_d[mejor_ri]
+            seg_d    = sorted(scores_d, reverse=True)[1]
+            digitos.append(str(mejor_ri) if top_d >= DIFF_THR and (top_d - seg_d) >= DIFF_DELTA else None)
+        codigo = "".join(d if d is not None else "?" for d in digitos)
+    else:
+        codigo = None
+
+    return {k: answers[k] for k in sorted(answers)}, codigo
 
 
 def cargar_plantilla():
@@ -262,11 +419,12 @@ def main():
         img = cv2.imread(str(img_path))
         if img is None:
             continue
-        respuestas = process(img, plantilla_gray)
+        respuestas, codigo = process(img, plantilla_gray)
         marcadas = sum(1 for v in respuestas.values() if v is not None)
         nulas    = sum(1 for v in respuestas.values() if v is None)
         results.append({
             "archivo": img_path.name,
+            "codigo": codigo,
             "total_preguntas": len(respuestas),
             "respuestas": respuestas,
             "resumen": {"marcadas": marcadas, "en_blanco": nulas}

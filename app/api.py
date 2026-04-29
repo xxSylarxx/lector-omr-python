@@ -44,7 +44,7 @@ def _procesar_archivo(archivo):
         return {"archivo": nombre, "ok": False, "error": "No se pudo decodificar la imagen"}
 
     try:
-        respuestas = omr.process(img, _plantilla)
+        respuestas, codigo = omr.process(img, _plantilla)
     except Exception as e:
         return {"archivo": nombre, "ok": False, "error": f"Error interno: {e}"}
 
@@ -54,6 +54,7 @@ def _procesar_archivo(archivo):
     return {
         "archivo": nombre,
         "ok": True,
+        "codigo": codigo,
         "total_preguntas": len(respuestas),
         "marcadas":  sum(1 for v in respuestas.values() if v is not None),
         "en_blanco": sum(1 for v in respuestas.values() if v is None),
